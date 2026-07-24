@@ -1,0 +1,19 @@
+import { listToolkits } from "@/lib/composio";
+import { requireAgentAccess } from "@/lib/auth";
+import { handleError, json } from "@/lib/http";
+
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function GET(request: Request, { params }: Ctx) {
+  try {
+    const { id } = await params;
+    await requireAgentAccess(id, "member");
+
+    const { searchParams } = new URL(request.url);
+    const search = searchParams.get("search")?.trim() || undefined;
+
+    return json(await listToolkits(search));
+  } catch (e) {
+    return handleError(e);
+  }
+}

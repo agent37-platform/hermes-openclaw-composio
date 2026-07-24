@@ -1,0 +1,3 @@
+name: composio-environment
+version: "0.1.0"
+description: Tells the agent to reach third-party apps through your Composio MCP server

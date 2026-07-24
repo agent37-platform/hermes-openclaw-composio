@@ -1,0 +1,16 @@
+import { listConnections } from "@/lib/composio";
+import { requireAgentAccess } from "@/lib/auth";
+import { handleError, json } from "@/lib/http";
+
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function GET(_request: Request, { params }: Ctx) {
+  try {
+    const { id } = await params;
+    await requireAgentAccess(id, "member");
+
+    return json(await listConnections(id));
+  } catch (e) {
+    return handleError(e);
+  }
+}
