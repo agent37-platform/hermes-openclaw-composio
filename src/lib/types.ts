@@ -40,7 +40,7 @@ export interface AgentRow {
   // Bring-your-own-Composio bookkeeping (see src/lib/bootstrap.ts + /api/composio-mcp).
   proxy_token_hash?: string | null;
   bootstrapped_at?: string | null;
-  composio_wired_at?: string | null;
+  composio_mcp_url?: string | null;
 }
 
 // One metering row per (tool, day) from the Composio MCP proxy.

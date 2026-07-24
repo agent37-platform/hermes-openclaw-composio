@@ -4,12 +4,13 @@
   "private": true,
   "scripts": {
     "setup": "node scripts/setup.mjs",
-    "dev": "next dev",
+    "dev": "node scripts/dev.mjs",
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "smoke": "node scripts/smoke.mjs",
-    "templates:publish": "node scripts/templates.mjs"
+    "templates:publish": "node scripts/templates.mjs",
+    "dev:next": "next dev"
   },
   "dependencies": {
     "@composio/core": "^0.13.1",

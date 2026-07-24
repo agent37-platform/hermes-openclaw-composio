@@ -51,10 +51,16 @@ export function kickBootstrap(agentId: string): void {
     .finally(() => inflight.delete(agentId));
 }
 
-// True when the agent still owes a bootstrap step the environment can now satisfy.
-export function needsBootstrap(row: { bootstrapped_at?: string | null; composio_wired_at?: string | null }): boolean {
+// True when the agent still owes a bootstrap step the environment can now satisfy: never
+// bootstrapped, Composio creds appeared after it was made, or the app's public URL moved (dev
+// tunnels change every run) so its wired MCP URL is dead.
+export function needsBootstrap(row: {
+  bootstrapped_at?: string | null;
+  composio_mcp_url?: string | null;
+}): boolean {
   if (!row.bootstrapped_at) return true;
-  return !row.composio_wired_at && composioAvailable();
+  if (!composioAvailable()) return false;
+  return row.composio_mcp_url !== mcpPublicUrl();
 }
 
 function composioAvailable(): boolean {
@@ -139,10 +145,10 @@ async function bootstrapAgent(agentId: string): Promise<void> {
     .update({ bootstrap_claimed_at: new Date().toISOString() })
     .eq("agent37_id", agentId)
     .or(`bootstrap_claimed_at.is.null,bootstrap_claimed_at.lt.${staleBefore}`)
-    .select("template, bootstrapped_at, composio_wired_at");
+    .select("template, bootstrapped_at");
   if (claimError) throw new Error(`bootstrap claim failed: ${claimError.message}`);
   if (!claimed?.length) return;
-  const row = claimed[0] as { template: string | null; bootstrapped_at: string | null; composio_wired_at: string | null };
+  const row = claimed[0] as { template: string | null; bootstrapped_at: string | null };
 
   const releaseClaim = () =>
     db.from("agents").update({ bootstrap_claimed_at: null }).eq("agent37_id", agentId).then(() => {});
@@ -191,22 +197,28 @@ async function bootstrapAgent(agentId: string): Promise<void> {
       );
     }
 
-    const input: ConfigInput = { proxyUrl, starterToken, modelId, mcpUrl, mcpToken };
-    if (runtime === "hermes") {
-      // A fresh agent gets the full config; the late Composio re-wire (bootstrapped earlier,
-      // creds appeared later) only appends the MCP block so the user's model choice and any
-      // manual config edits survive.
-      if (row.bootstrapped_at) {
-        await appendHermesMcp(agentId, input);
-      } else {
+    const input: ConfigInput = { proxyUrl, starterToken, modelId };
+    // Base config only on the FIRST bootstrap — a re-wire (Composio creds appeared later, or
+    // the app's public URL moved) must not clobber the user's model choice or manual edits.
+    if (!row.bootstrapped_at) {
+      if (runtime === "hermes") {
         await writeHermesConfig(agentId, input);
+      } else {
+        await writeOpenclawConfig(agentId, input);
       }
-    } else {
-      // The OpenClaw writer is a key-level merge, safe on both the fresh and re-wire paths.
-      await writeOpenclawConfig(agentId, input);
+    }
+    // The `apps` MCP wiring lives in a small state file the boot hook merges into the config at
+    // every start — so a re-wire is just: replace the state file, restart.
+    if (wireComposio && mcpUrl && mcpToken) {
+      await execWriteFile(
+        agentId,
+        "~/.agent37/hooks/composio-mcp.json",
+        JSON.stringify({ url: mcpUrl, token: mcpToken }) + "\n"
+      );
     }
     // The restart below recreates the container and ROTATES the starter credential — this hook
-    // refreshes the provider from the new env before services start, every boot from now on.
+    // refreshes the provider from the new env (and the apps block from the state file) before
+    // services start, every boot from now on.
     await installRefreshHook(agentId, runtime);
 
     await agent37.restart(agentId);
@@ -221,7 +233,7 @@ async function bootstrapAgent(agentId: string): Promise<void> {
       .from("agents")
       .update({
         bootstrapped_at: row.bootstrapped_at ?? now,
-        ...(wireComposio ? { composio_wired_at: now } : {}),
+        ...(wireComposio ? { composio_mcp_url: mcpUrl } : {}),
         bootstrap_claimed_at: null,
       })
       .eq("agent37_id", agentId);
@@ -237,8 +249,6 @@ interface ConfigInput {
   proxyUrl: string;
   starterToken: string;
   modelId: string;
-  mcpUrl: string | null;
-  mcpToken: string | null;
 }
 
 // Match the managed image's normalization: the starter proxy is an OpenAI-compatible endpoint
@@ -263,8 +273,9 @@ async function execWriteFile(agentId: string, path: string, content: string): Pr
 // CURRENT starter credentials from env into the agent's config — the baked values go stale the
 // moment the platform recreates the container and reissues the credential.
 const HERMES_REFRESH_PY = `#!/usr/bin/env python3
-# Managed by the app (bootstrap): refresh the Agent37 provider from the current starter env.
-import os, yaml
+# Managed by the app (bootstrap): refresh the Agent37 provider from the current starter env and
+# the \`apps\` MCP server from the composio-mcp.json state file.
+import json, os, yaml
 
 path = os.path.expanduser("~/.hermes/config.yaml")
 try:
@@ -278,32 +289,44 @@ if not isinstance(config, dict):
 url = os.environ.get("AGENT37_STARTER_PROXY_URL", "").rstrip("/")
 token = os.environ.get("AGENT37_STARTER_TOKEN", "")
 model_id = os.environ.get("AGENT37_STARTER_MODEL_ID", "default")
-if not url or not token:
-    raise SystemExit(0)
-if not url.endswith("/v1"):
-    url += "/v1"
+if url and token:
+    if not url.endswith("/v1"):
+        url += "/v1"
+    providers = config.get("custom_providers")
+    if not isinstance(providers, list):
+        providers = []
+    entry = {"name": "Agent37", "base_url": url, "api_key": token, "api_mode": "chat_completions", "model": model_id}
+    for i, existing in enumerate(providers):
+        if isinstance(existing, dict) and existing.get("name") == "Agent37":
+            providers[i] = {**existing, **entry}
+            break
+    else:
+        providers.append(entry)
+    config["custom_providers"] = providers
 
-providers = config.get("custom_providers")
-if not isinstance(providers, list):
-    providers = []
-entry = {"name": "Agent37", "base_url": url, "api_key": token, "api_mode": "chat_completions", "model": model_id}
-for i, existing in enumerate(providers):
-    if isinstance(existing, dict) and existing.get("name") == "Agent37":
-        providers[i] = {**existing, **entry}
-        break
-else:
-    providers.append(entry)
-config["custom_providers"] = providers
+    model = config.get("model")
+    if not isinstance(model, dict) or not (model.get("default") or model.get("model")):
+        config["model"] = {"provider": "custom:Agent37", "default": model_id}
 
-model = config.get("model")
-if not isinstance(model, dict) or not (model.get("default") or model.get("model")):
-    config["model"] = {"provider": "custom:Agent37", "default": model_id}
+state_path = os.path.expanduser("~/.agent37/hooks/composio-mcp.json")
+try:
+    with open(state_path) as f:
+        state = json.load(f)
+except (OSError, ValueError):
+    state = None
+if isinstance(state, dict) and state.get("url") and state.get("token"):
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers["apps"] = {"url": state["url"], "headers": {"Authorization": "Bearer " + state["token"]}}
+    config["mcp_servers"] = servers
 
 with open(path, "w") as f:
     yaml.safe_dump(config, f, sort_keys=False)
 `;
 
-const OPENCLAW_REFRESH_JS = `// Managed by the app (bootstrap): refresh the agent37 provider from the current starter env.
+const OPENCLAW_REFRESH_JS = `// Managed by the app (bootstrap): refresh the agent37 provider from the current starter env
+// and the \`apps\` MCP server from the composio-mcp.json state file.
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -316,24 +339,38 @@ try {
   catch { c = vm.runInNewContext("(" + text + ")", Object.create(null), { timeout: 1000 }); }
 } catch {}
 if (!c || typeof c !== "object" || Array.isArray(c)) process.exit(0);
+const obj = (x) => (x && typeof x === "object" && !Array.isArray(x) ? x : {});
 const url = (process.env.AGENT37_STARTER_PROXY_URL || "").replace(/\\/$/, "");
 const token = process.env.AGENT37_STARTER_TOKEN || "";
 const modelId = process.env.AGENT37_STARTER_MODEL_ID || "default";
-if (!url || !token) process.exit(0);
-const obj = (x) => (x && typeof x === "object" && !Array.isArray(x) ? x : {});
-c.models = obj(c.models);
-c.models.mode = "merge";
-c.models.providers = obj(c.models.providers);
-const prev = obj(c.models.providers.agent37);
-c.models.providers.agent37 = {
-  ...prev,
-  baseUrl: url,
-  apiKey: token,
-  api: "openai-completions",
-  models: Array.isArray(prev.models) && prev.models.length
-    ? prev.models
-    : [{ id: modelId, name: "Agent37 Default", input: ["text", "image"] }],
-};
+if (url && token) {
+  c.models = obj(c.models);
+  c.models.mode = "merge";
+  c.models.providers = obj(c.models.providers);
+  const prev = obj(c.models.providers.agent37);
+  c.models.providers.agent37 = {
+    ...prev,
+    baseUrl: url,
+    apiKey: token,
+    api: "openai-completions",
+    models: Array.isArray(prev.models) && prev.models.length
+      ? prev.models
+      : [{ id: modelId, name: "Agent37 Default", input: ["text", "image"] }],
+  };
+}
+let state = null;
+try {
+  state = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".agent37", "hooks", "composio-mcp.json"), "utf8"));
+} catch {}
+if (state && state.url && state.token) {
+  c.mcp = obj(c.mcp);
+  c.mcp.servers = obj(c.mcp.servers);
+  c.mcp.servers.apps = {
+    url: state.url,
+    transport: "streamable-http",
+    headers: { Authorization: "Bearer " + state.token },
+  };
+}
 fs.writeFileSync(file, JSON.stringify(c, null, 2) + "\\n");
 `;
 
@@ -380,36 +417,9 @@ async function writeHermesConfig(agentId: string, input: ConfigInput): Promise<v
     '    - "agent37-environment"',
     '    - "composio-environment"',
   ];
-  if (input.mcpUrl && input.mcpToken) {
-    lines.push(...hermesMcpLines(input.mcpUrl, input.mcpToken));
-  }
+  // The `apps` MCP server block is NOT written here — the refresh hook merges it from the
+  // composio-mcp.json state file at every boot, so a URL change is just a state-file replace.
   await execWriteFile(agentId, "~/.hermes/config.yaml", lines.join("\n") + "\n");
-}
-
-function hermesMcpLines(mcpUrl: string, mcpToken: string): string[] {
-  return [
-    "mcp_servers:",
-    "  apps:",
-    `    url: "${mcpUrl}"`,
-    "    headers:",
-    `      Authorization: "Bearer ${mcpToken}"`,
-  ];
-}
-
-// The late re-wire: append only the MCP block. If a top-level mcp_servers key already exists
-// (the user took the config over by hand), leave it alone — the grep guard makes the append a
-// no-op and the wired stamp stops the retry loop.
-async function appendHermesMcp(agentId: string, input: ConfigInput): Promise<void> {
-  if (!input.mcpUrl || !input.mcpToken) return;
-  const block = "\n" + hermesMcpLines(input.mcpUrl, input.mcpToken).join("\n") + "\n";
-  const b64 = Buffer.from(block, "utf8").toString("base64");
-  const result = await agent37.exec(
-    agentId,
-    `grep -q '^mcp_servers:' ~/.hermes/config.yaml 2>/dev/null || echo ${b64} | base64 -d >> ~/.hermes/config.yaml`
-  );
-  if (result.exit_code !== 0) {
-    throw new Error(`appending mcp_servers failed: ${result.stderr || result.stdout}`);
-  }
 }
 
 // OpenClaw: openclaw.json already carries structural config the base image writes at every boot
@@ -421,8 +431,6 @@ async function writeOpenclawConfig(agentId: string, input: ConfigInput): Promise
     providerBaseUrl: input.proxyUrl.replace(/\/$/, ""),
     starterToken: input.starterToken,
     modelId: input.modelId,
-    mcpUrl: input.mcpUrl,
-    mcpToken: input.mcpToken,
   };
   const script = `
 const fs = require("fs");
@@ -462,15 +470,6 @@ if (!c.agents.defaults.model.primary) c.agents.defaults.model.primary = "agent37
 c.agents.defaults.models = obj(c.agents.defaults.models);
 c.agents.defaults.models["agent37/" + v.modelId] = { alias: "agent37-default" };
 c.agents.defaults.models["agent37/*"] = {};
-if (v.mcpUrl && v.mcpToken) {
-  c.mcp = obj(c.mcp);
-  c.mcp.servers = obj(c.mcp.servers);
-  c.mcp.servers.apps = {
-    url: v.mcpUrl,
-    transport: "streamable-http",
-    headers: { Authorization: "Bearer " + v.mcpToken },
-  };
-}
 fs.mkdirSync(path.dirname(file), { recursive: true });
 fs.writeFileSync(file, JSON.stringify(c, null, 2) + "\\n");
 `;

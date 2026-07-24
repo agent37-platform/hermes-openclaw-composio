@@ -5,14 +5,14 @@
 -- presented Bearer token by this hash on every tool call.
 -- bootstrapped_at: set when post-create bootstrap (model provider + Composio MCP wiring + restart)
 -- has completed. Null on a running agent means bootstrap is owed — the fleet GET re-kicks it.
--- composio_wired_at: set when the agent's config carries the Composio MCP block. Stays null when
--- COMPOSIO_API_KEY / NEXT_PUBLIC_SITE_URL were missing at bootstrap time, so wiring is retried
--- once they appear.
+-- composio_mcp_url: the proxy URL the agent is wired with (null = not wired, e.g. Composio creds
+-- or the public URL were missing at bootstrap time). When it differs from the app's current
+-- public URL (dev tunnels change every run), the fleet GET re-wires the agent.
 -- bootstrap_claimed_at: a short lease so only one server instance bootstraps an agent at a time
 -- (serverless deploys run many instances; in-memory single-flight isn't enough).
 alter table public.agents add column if not exists proxy_token_hash text;
 alter table public.agents add column if not exists bootstrapped_at timestamptz;
-alter table public.agents add column if not exists composio_wired_at timestamptz;
+alter table public.agents add column if not exists composio_mcp_url text;
 alter table public.agents add column if not exists bootstrap_claimed_at timestamptz;
 
 create index if not exists agents_proxy_token_hash_idx on public.agents (proxy_token_hash);

@@ -18,12 +18,13 @@ Agent37 workspace (a one-time cloud build — no local Docker). It's idempotent 
 blank values. Per-variable docs live in [`.env.example`](.env.example).
 
 > **The one deployment nuance:** agents run in Agent37's cloud and reach your Composio through
-> `https://your-app/api/composio-mcp`, so agent tool calls need this app on a **public URL**
-> (`NEXT_PUBLIC_SITE_URL`). On localhost everything else still works — dashboard, chat, files —
-> and agents created before the URL exists wire themselves up automatically once you set it
-> (the app re-runs their bootstrap). Deploy to Vercel first if you want tool calls on day one,
-> or point a tunnel (e.g. `cloudflared tunnel --url http://localhost:3000`) at dev and put that
-> URL in `NEXT_PUBLIC_SITE_URL`.
+> `https://your-app/api/composio-mcp`, so agent tool calls need this app on a **public URL**.
+> `npm run dev` handles this itself: when `COMPOSIO_API_KEY` is set and no public
+> `NEXT_PUBLIC_SITE_URL` is configured, it starts a free [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+> quick tunnel and agents wire (and re-wire, when the tunnel URL changes between runs)
+> themselves automatically. No cloudflared installed (`brew install cloudflared`)? Everything
+> except agent tool calls still works. In production `NEXT_PUBLIC_SITE_URL` is your stable URL
+> and no tunnel is involved.
 
 ## For your coding agent
 
@@ -57,11 +58,11 @@ these steps in order; don't skip the checks.
    Agent37 **cloud build** that streams its log here for a few minutes — that's normal; wait for
    it. A `402` means the Agent37 wallet isn't funded (see step 2).
 7. **Verify.** Run `npm run typecheck` and `npm run build` (no test suite — these two are the gate).
-8. **Start.** Run `npm run dev` and report the URL (<http://localhost:3000>): I sign up with
-   email + password (open signup, no email verification) → land in a fresh workspace. Tell me
-   two things: creating an agent needs a funded wallet (a `402` at create is the wallet, not a
-   bug), and agent **tool calls** need `NEXT_PUBLIC_SITE_URL` on a public URL (deploy or tunnel —
-   see the note above; chat and files work without it).
+8. **Start.** Check `cloudflared` is installed (`cloudflared --version`; if missing, install it —
+   `brew install cloudflared` — so agent tool calls work, see the note above). Run `npm run dev`
+   and report the URL (<http://localhost:3000>): I sign up with email + password (open signup,
+   no email verification) → land in a fresh workspace. Remind me that creating an agent needs a
+   funded wallet — a `402` at create time is the wallet, not a bug.
 
 Constraints: keep changes minimal; add no features; every secret stays server-side;
 branding stays code-side (`src/config/branding.ts`).
