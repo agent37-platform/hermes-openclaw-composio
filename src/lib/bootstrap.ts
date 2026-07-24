@@ -16,10 +16,17 @@ import { createAdminClient } from "@/lib/supabase/admin";
 //   2. The `apps` MCP server → this app's /api/composio-mcp proxy, authenticated by a per-agent
 //      token minted here. That is the bring-your-own-Composio wiring.
 //
-// Then it restarts the instance so the agent loads the config. Config lives on the persistent
-// volume, so one bootstrap survives restarts, image updates, and resizes. Runs in the background
-// (create returns immediately); the fleet GET overlays "starting" until `bootstrapped_at` lands
-// and re-kicks bootstrap if it never did (e.g. the server restarted mid-run).
+// The starter credential ROTATES on every container recreate (restart/update/resize), so the
+// provider block can't just be baked once: bootstrap also installs a post-restart hook (the base
+// images run ~/.agent37/hooks/post-restart.sh before starting services) that re-reads the current
+// env and refreshes the provider config at every boot — the same trick the managed images use.
+// The kit's own `cpx_` MCP token never rotates, so the `apps` block stays static.
+//
+// Then it restarts the instance so the agent loads the config. Config + hook live on the
+// persistent volume, so one bootstrap survives restarts, image updates, and resizes. Runs in the
+// background (create returns immediately); the fleet GET overlays "starting" until
+// `bootstrapped_at` lands and re-kicks bootstrap if it never did (e.g. the server restarted
+// mid-run).
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -91,6 +98,24 @@ async function waitHealthy(agentId: string, attempts = 45): Promise<boolean> {
   return false;
 }
 
+// OpenClaw runs first-boot state migrations under a lock; restarting the container mid-migration
+// strands the lock and OpenClaw then refuses to start until it expires (~5 min). Its native
+// gateway listening on loopback 28789 is the "migrations finished" signal — wait for it before
+// restarting, and again after, so a lock-crash surfaces as a bootstrap failure (which the fleet
+// poll retries) instead of a silently dead agent.
+async function waitOpenclawReady(agentId: string, attempts = 60): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const result = await agent37.exec(agentId, "ss -ltn 2>/dev/null | grep -c ':28789 '");
+      if (parseInt(result.stdout.trim(), 10) > 0) return true;
+    } catch {
+      /* transient exec failure */
+    }
+    await sleep(5000);
+  }
+  return false;
+}
+
 // The starter credentials only exist as env INSIDE the instance — read them off the entrypoint
 // (PID 1), which is robust regardless of what shell/env `exec` itself gets.
 async function readStarterEnv(agentId: string): Promise<Record<string, string>> {
@@ -136,6 +161,10 @@ async function bootstrapAgent(agentId: string): Promise<void> {
       return;
     }
 
+    if (runtime === "openclaw" && !(await waitOpenclawReady(agentId))) {
+      throw new Error("OpenClaw never finished its first-boot migrations; retrying later");
+    }
+
     const starter = await readStarterEnv(agentId);
     const proxyUrl = starter.AGENT37_STARTER_PROXY_URL ?? "";
     const starterToken = starter.AGENT37_STARTER_TOKEN ?? "";
@@ -176,10 +205,16 @@ async function bootstrapAgent(agentId: string): Promise<void> {
       // The OpenClaw writer is a key-level merge, safe on both the fresh and re-wire paths.
       await writeOpenclawConfig(agentId, input);
     }
+    // The restart below recreates the container and ROTATES the starter credential — this hook
+    // refreshes the provider from the new env before services start, every boot from now on.
+    await installRefreshHook(agentId, runtime);
 
     await agent37.restart(agentId);
     await sleep(3000);
     await waitHealthy(agentId);
+    if (runtime === "openclaw" && !(await waitOpenclawReady(agentId))) {
+      throw new Error("OpenClaw did not come back after the config restart; retrying later");
+    }
 
     const now = new Date().toISOString();
     const { error: stampError } = await db
@@ -221,6 +256,104 @@ async function execWriteFile(agentId: string, path: string, content: string): Pr
   );
   if (result.exit_code !== 0) {
     throw new Error(`writing ${path} failed: ${result.stderr || result.stdout}`);
+  }
+}
+
+// The provider-refresh hook: runs at every container start (before services), pulling the
+// CURRENT starter credentials from env into the agent's config — the baked values go stale the
+// moment the platform recreates the container and reissues the credential.
+const HERMES_REFRESH_PY = `#!/usr/bin/env python3
+# Managed by the app (bootstrap): refresh the Agent37 provider from the current starter env.
+import os, yaml
+
+path = os.path.expanduser("~/.hermes/config.yaml")
+try:
+    with open(path) as f:
+        config = yaml.safe_load(f) or {}
+except FileNotFoundError:
+    config = {}
+if not isinstance(config, dict):
+    raise SystemExit(0)
+
+url = os.environ.get("AGENT37_STARTER_PROXY_URL", "").rstrip("/")
+token = os.environ.get("AGENT37_STARTER_TOKEN", "")
+model_id = os.environ.get("AGENT37_STARTER_MODEL_ID", "default")
+if not url or not token:
+    raise SystemExit(0)
+if not url.endswith("/v1"):
+    url += "/v1"
+
+providers = config.get("custom_providers")
+if not isinstance(providers, list):
+    providers = []
+entry = {"name": "Agent37", "base_url": url, "api_key": token, "api_mode": "chat_completions", "model": model_id}
+for i, existing in enumerate(providers):
+    if isinstance(existing, dict) and existing.get("name") == "Agent37":
+        providers[i] = {**existing, **entry}
+        break
+else:
+    providers.append(entry)
+config["custom_providers"] = providers
+
+model = config.get("model")
+if not isinstance(model, dict) or not (model.get("default") or model.get("model")):
+    config["model"] = {"provider": "custom:Agent37", "default": model_id}
+
+with open(path, "w") as f:
+    yaml.safe_dump(config, f, sort_keys=False)
+`;
+
+const OPENCLAW_REFRESH_JS = `// Managed by the app (bootstrap): refresh the agent37 provider from the current starter env.
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const vm = require("vm");
+const file = path.join(os.homedir(), ".openclaw", "openclaw.json");
+let c = {};
+try {
+  const text = fs.readFileSync(file, "utf8");
+  try { c = JSON.parse(text); }
+  catch { c = vm.runInNewContext("(" + text + ")", Object.create(null), { timeout: 1000 }); }
+} catch {}
+if (!c || typeof c !== "object" || Array.isArray(c)) process.exit(0);
+const url = (process.env.AGENT37_STARTER_PROXY_URL || "").replace(/\\/$/, "");
+const token = process.env.AGENT37_STARTER_TOKEN || "";
+const modelId = process.env.AGENT37_STARTER_MODEL_ID || "default";
+if (!url || !token) process.exit(0);
+const obj = (x) => (x && typeof x === "object" && !Array.isArray(x) ? x : {});
+c.models = obj(c.models);
+c.models.mode = "merge";
+c.models.providers = obj(c.models.providers);
+const prev = obj(c.models.providers.agent37);
+c.models.providers.agent37 = {
+  ...prev,
+  baseUrl: url,
+  apiKey: token,
+  api: "openai-completions",
+  models: Array.isArray(prev.models) && prev.models.length
+    ? prev.models
+    : [{ id: modelId, name: "Agent37 Default", input: ["text", "image"] }],
+};
+fs.writeFileSync(file, JSON.stringify(c, null, 2) + "\\n");
+`;
+
+// Install the refresh script and chain it into the base image's post-restart hook (created by
+// the entrypoint on first boot; the grep keeps the append idempotent).
+async function installRefreshHook(agentId: string, runtime: AgentRuntime): Promise<void> {
+  const script = runtime === "hermes" ? HERMES_REFRESH_PY : OPENCLAW_REFRESH_JS;
+  const scriptPath = `~/.agent37/hooks/refresh-agent37-provider.${runtime === "hermes" ? "py" : "js"}`;
+  await execWriteFile(agentId, scriptPath, script);
+
+  const runLine =
+    runtime === "hermes"
+      ? `"\${HERMES_PYTHON:-/usr/local/lib/hermes/hermes-agent/venv/bin/python}" ${scriptPath} || true`
+      : `node ${scriptPath} || true`;
+  const result = await agent37.exec(
+    agentId,
+    `touch ~/.agent37/hooks/post-restart.sh && grep -q refresh-agent37-provider ~/.agent37/hooks/post-restart.sh || printf '%s\\n' '${runLine}' >> ~/.agent37/hooks/post-restart.sh`
+  );
+  if (result.exit_code !== 0) {
+    throw new Error(`installing refresh hook failed: ${result.stderr || result.stdout}`);
   }
 }
 

@@ -34,10 +34,13 @@ It is the sibling of the [Agent37 Starter Kit](https://github.com/agent37-platfo
    so after create the app writes the agent's config over `/v1` exec: Agent37's managed model
    (from the starter credentials in the instance env — chat works with zero model setup) plus
    an `apps` MCP server pointing at this app's `/api/composio-mcp` with a per-agent token; then
-   restarts the instance. Config lives on the persistent volume — one bootstrap survives
-   restarts, image updates, and resizes. Runs in the background; the fleet GET overlays
-   "starting" until `bootstrapped_at` lands and re-kicks bootstrap when it's owed (server died
-   mid-run, or Composio creds appeared later).
+   restarts the instance. Because the starter credential rotates on every container recreate,
+   bootstrap also installs a provider-refresh script chained into the base image's
+   `~/.agent37/hooks/post-restart.sh`, which re-reads the current env at every boot (the kit's
+   own `cpx_` token never rotates, so the `apps` block stays static). Config + hook live on the
+   persistent volume — one bootstrap survives restarts, image updates, and resizes. Runs in the
+   background; the fleet GET overlays "starting" until `bootstrapped_at` lands and re-kicks
+   bootstrap when it's owed (server died mid-run, or Composio creds appeared later).
 3. **The Composio MCP transport proxy** (`src/app/api/composio-mcp/route.ts`). The ONLY place
    agent tool traffic meets `COMPOSIO_API_KEY`: per-agent Bearer token → agent lookup →
    Composio tool-router session scoped to `agent:{id}` (server-derived — agents can't reach
