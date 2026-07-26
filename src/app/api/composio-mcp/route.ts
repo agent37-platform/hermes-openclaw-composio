@@ -129,11 +129,11 @@ async function recordUsage(db: ReturnType<typeof createAdminClient>, agentId: st
 
 export { handle as POST, handle as DELETE };
 
-// The optional MCP standalone GET (server-push SSE) stream is refused. Proxying it parked one
-// open stream per agent on a serverless function until maxDuration, then the client reconnected
-// — permanent wall-clock billing for a channel nothing here uses (per-request streaming rides
-// the POST response). Must stay a clean 405: a stream that is accepted and then closed puts both
-// official client SDKs into a ~1s reconnect loop.
+// The optional MCP standalone GET (server-push SSE) stream is refused. Every agent's MCP client
+// opens it at connect and holds it, so proxying it parks one open stream per agent on a
+// serverless function until maxDuration and the client then reconnects — for a channel this app
+// doesn't use (per-request streaming rides the POST response). Must stay a clean 405: a stream
+// that is accepted and then closed puts both official client SDKs into a ~1s reconnect loop.
 export function GET(): Response {
   return new Response(null, { status: 405, headers: { allow: "POST, DELETE, OPTIONS" } });
 }
