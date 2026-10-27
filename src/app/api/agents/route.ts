@@ -147,7 +147,6 @@ export async function POST(request: Request) {
         memory: DEFAULT_AGENT.memory,
         disk: DEFAULT_AGENT.disk,
       },
-      user: user.id,
       metadata: { app_workspace: workspaceId },
       budget: { monthly_cap_micros: usdToMicros(DEFAULT_AGENT.monthlyCapUsd) },
     });

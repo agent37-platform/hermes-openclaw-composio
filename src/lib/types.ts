@@ -66,7 +66,6 @@ export interface Agent {
   template_revision?: number | null;
   resources: { cpu: number; memory: number; disk: number };
   ports: { port: number; default: boolean; url: string }[];
-  user: string | null;
   name: string | null;
   metadata: Record<string, unknown> | null;
   paid_through: number | null;
