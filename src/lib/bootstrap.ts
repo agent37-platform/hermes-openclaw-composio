@@ -172,8 +172,10 @@ async function bootstrapAgent(agentId: string): Promise<void> {
     }
 
     const starter = await readStarterEnv(agentId);
-    const proxyUrl = starter.AGENT37_STARTER_PROXY_URL ?? "";
-    const starterToken = starter.AGENT37_STARTER_TOKEN ?? "";
+    // AGENT37_LLM_PROXY_URL / AGENT37_MANAGED_TOKEN are the documented names and the only ones
+    // a newer Agent37 account's instance carries; the STARTER names are older aliases.
+    const proxyUrl = starter.AGENT37_STARTER_PROXY_URL || starter.AGENT37_LLM_PROXY_URL || "";
+    const starterToken = starter.AGENT37_MANAGED_TOKEN || starter.AGENT37_STARTER_TOKEN || "";
     const modelId = starter.AGENT37_STARTER_MODEL_ID || "default";
     if (!proxyUrl || !starterToken) {
       throw new Error("instance has no starter credentials in /proc/1/environ");
@@ -286,8 +288,8 @@ except FileNotFoundError:
 if not isinstance(config, dict):
     raise SystemExit(0)
 
-url = os.environ.get("AGENT37_STARTER_PROXY_URL", "").rstrip("/")
-token = os.environ.get("AGENT37_STARTER_TOKEN", "")
+url = (os.environ.get("AGENT37_STARTER_PROXY_URL") or os.environ.get("AGENT37_LLM_PROXY_URL") or "").rstrip("/")
+token = os.environ.get("AGENT37_MANAGED_TOKEN") or os.environ.get("AGENT37_STARTER_TOKEN") or ""
 model_id = os.environ.get("AGENT37_STARTER_MODEL_ID", "default")
 if url and token:
     if not url.endswith("/v1"):
@@ -340,8 +342,8 @@ try {
 } catch {}
 if (!c || typeof c !== "object" || Array.isArray(c)) process.exit(0);
 const obj = (x) => (x && typeof x === "object" && !Array.isArray(x) ? x : {});
-const url = (process.env.AGENT37_STARTER_PROXY_URL || "").replace(/\\/$/, "");
-const token = process.env.AGENT37_STARTER_TOKEN || "";
+const url = (process.env.AGENT37_STARTER_PROXY_URL || process.env.AGENT37_LLM_PROXY_URL || "").replace(/\\/$/, "");
+const token = process.env.AGENT37_MANAGED_TOKEN || process.env.AGENT37_STARTER_TOKEN || "";
 const modelId = process.env.AGENT37_STARTER_MODEL_ID || "default";
 if (url && token) {
   c.models = obj(c.models);
